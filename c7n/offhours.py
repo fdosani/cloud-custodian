@@ -232,10 +232,7 @@ class Time(Filter):
         #override get_sentinel_time with get_custom_time if custom downtime
         #detected
         if self.is_custom(parsed):
-            if self.get_custom_time(i, now, parsed):
-                return True
-            else:
-                return False
+            return self.get_custom_time(i, now, parsed)
 
         sentinel = self.get_sentinel_time(tz)
 
