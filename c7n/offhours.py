@@ -306,9 +306,9 @@ class Time(Filter):
             return False
 
     def get_custom_time(self, i, now, parts):
-        if type(self).__name__ == "InstanceOnHour":
+        if type(self).__name__ in ("InstanceOnHour", "OnHour"):
             time = parts.get("on")
-        elif type(self).__name__ == "InstanceOffHour":
+        elif type(self).__name__ in ("InstanceOffHour", "OffHour"):
             time = parts.get("off")
         else:
             return False
