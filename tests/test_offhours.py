@@ -201,3 +201,68 @@ class OffHoursFilterTest(BaseTest):
         self.assertEqual(OffHour({}).is_custom(parts_true), True)
         self.assertEqual(OffHour({}).is_custom(parts_false1), False)
         self.assertEqual(OffHour({}).is_custom(parts_false2), False)
+
+    def test_custom_offhours(self):
+        t = datetime.datetime.now(zoneinfo.gettz('America/New_York'))
+        t = t.replace(year=2016, month=5, day=26, hour=19, minute=00)
+        results = []
+
+        with mock_datetime_now(t, datetime):
+            for i in [instance(Tags=[{'Key': 'maid_offhours',
+                                'Value': 'off=(m-f,19);on=(m-f,7);tz=et'}]),
+                      instance(Tags=[{'Key': 'maid_offhours',
+                                'Value': 'off=(m-f,20);on=(m-f,7);tz=et'}])]:
+                results.append(OffHour({})(i))
+            self.assertEqual(results, [True, False])
+
+    def test_custom_onhours(self):
+        t = datetime.datetime.now(zoneinfo.gettz('America/New_York'))
+        t = t.replace(year=2016, month=5, day=26, hour=7, minute=00)
+        results = []
+
+        with mock_datetime_now(t, datetime):
+            for i in [instance(Tags=[{'Key': 'maid_offhours',
+                                'Value': 'off=(m-f,19);on=(m-f,7);tz=et'}]),
+                      instance(Tags=[{'Key': 'maid_offhours',
+                                'Value': 'off=(m-f,20);on=(m-f,9);tz=et'}])]:
+                results.append(OnHour({})(i))
+            self.assertEqual(results, [True, False])
+
+
+    def test_custom_bad_tz(self):
+        t = datetime.datetime.now(zoneinfo.gettz('America/New_York'))
+        t = t.replace(year=2016, month=5, day=26, hour=7, minute=00)
+        with mock_datetime_now(t, datetime):
+            i = instance(Tags=[{'Key': 'maid_offhours',
+                                'Value': 'off=(m-f,19);on=(m-f,7);tz=et'}])
+            self.assertEqual(OnHour({})(i), True)
+
+            i = instance(Tags=[{'Key': 'maid_offhours',
+                                'Value': 'off=(m-f,20);on=(m-f,7);tz=abc'}])
+            self.assertEqual(OnHour({})(i), False)
+
+    def test_custom_bad_hours(self):
+        t = datetime.datetime.now(zoneinfo.gettz('America/New_York'))
+        t = t.replace(year=2016, month=5, day=26, hour=19, minute=00)
+        with mock_datetime_now(t, datetime):
+            i = instance(Tags=[{'Key': 'maid_offhours',
+                                'Value': 'off=();tz=et'}])
+            #will go to default values
+            self.assertEqual(OffHour({})(i), True)
+
+            i = instance(Tags=[{'Key': 'maid_offhours',
+                                'Value': 'off=(m-f,90);on=(m-f,7);tz=et'}])
+            #malformed value
+            self.assertEqual(OffHour({})(i), True)
+
+        t = t.replace(year=2016, month=5, day=26, hour=13, minute=00)
+        with mock_datetime_now(t, datetime):
+            i = instance(Tags=[{'Key': 'maid_offhours',
+                                'Value': 'off=();tz=et'}])
+            #will go to default values, but not work due to default time
+            self.assertEqual(OffHour({})(i), False)
+
+            i = instance(Tags=[{'Key': 'maid_offhours',
+                                'Value': 'off=(m-f,90);on=(m-f,7);tz=et'}])
+            #will go to default values, but not work due to default time
+            self.assertEqual(OffHour({})(i), False)
