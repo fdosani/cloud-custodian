@@ -189,6 +189,7 @@ class Time(Filter):
     # Allow up to this many hours after sentinel time
     # to continue to match
     skew = 0
+    time_type = None
 
     def __init__(self, data, manager=None):
         super(Time, self).__init__(data, manager)
@@ -306,13 +307,10 @@ class Time(Filter):
             return False
 
     def get_custom_time(self, i, now, parts):
-        if type(self).__name__ in ("InstanceOnHour", "OnHour"):
-            time = parts.get("on")
-        elif type(self).__name__ in ("InstanceOffHour", "OffHour"):
-            time = parts.get("off")
-        else:
+        if self.time_type is None:
             return False
 
+        time = parts.get(self.time_type)
         tz = parts.get("tz")
 
         for item in time:
@@ -335,6 +333,7 @@ class OffHour(Time):
     schema = type_schema(
         'offhour', rinherit=Time.schema, required=['offhour', 'default_tz'],
         offhour={'type': 'integer', 'minimum': 0, 'maximum': 24})
+    time_type = "off"
 
     def get_sentinel_time(self, tz):
         t = super(OffHour, self).get_sentinel_time(tz)
@@ -346,6 +345,7 @@ class OnHour(Time):
     schema = type_schema(
         'onhour', rinherit=Time.schema, required=['onhour', 'default_tz'],
         onhour={'type': 'integer', 'minimum': 0, 'maximum': 24})
+    time_type = "on"
 
     def get_sentinel_time(self, tz):
         t = super(OnHour, self).get_sentinel_time(tz)
