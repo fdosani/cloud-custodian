@@ -212,10 +212,8 @@ class Time(Filter):
     def process_current_time(self, i, parts):
         try:
             parsed = ScheduleParser().parse(parts[0])
-            if parsed is None:
-                raise ValueError("malformed downtime tag")
         except Exception as e:
-            log.warning("downtime tag is malformed or empty, using defaults")
+            log.warning("Parsing Error: %s. Using default values" % e)
             parsed = ScheduleParser().parse("")
 
         tz_part = ['tz=%s' % parsed.get('tz')]
@@ -226,14 +224,14 @@ class Time(Filter):
         now = datetime.datetime.now(tz).replace(
             minute=0, second=0, microsecond=0)
 
-        if not self.weekends and now.weekday() in (5, 6):
-            log.debug("skipping weekends")
-            return False
-
         #override get_sentinel_time with get_custom_time if custom downtime
         #detected
         if self.is_custom(parsed):
             return self.get_custom_time(i, now, parsed)
+
+        if not self.weekends and now.weekday() in (5, 6):
+            log.debug("skipping weekends")
+            return False
 
         sentinel = self.get_sentinel_time(tz)
 
@@ -301,10 +299,8 @@ class Time(Filter):
 
 
     def is_custom(self, parts):
-        if len(parts) == 3 and parts.get("on") and parts.get("off"):
-            return True
-        else:
-            return False
+        return "tz" in parts and "on" in parts and "off" in parts
+
 
     def get_custom_time(self, i, now, parts):
         if self.time_type is None:
@@ -369,14 +365,14 @@ class ScheduleParser:
             # components must by key-value
             if not len(kv) == 2:
                 continue
-            key = kv[0]
-            value = kv[1]
+            key = kv[0].strip()
+            value = kv[1].strip()
             if key == 'on' or key == 'off':
                 # parse custom on/off hours
                 value = self.parse_custom_hours(value)
             schedule[key] = value
-        # add default timezone, if none supplied
-        if 'tz' not in schedule:
+        # add default timezone, if none supplied or blank
+        if schedule.get('tz') is None  or not schedule.get('tz'):
             schedule['tz'] = DEFAULT_TZ
         # validate
         if not self.is_valid(schedule):
@@ -397,20 +393,20 @@ class ScheduleParser:
             try:
                 hour[1] = int(hour[1])
                 if not self.is_valid_hour_range(hour[1]):
-                    raise ValueError
+                    raise ValueError("The specified hour is invalid")
                 parsed.append({
                     'days': self.expand_day_range(hour[0]),
                     'hour': hour[1]
                     })
             except ValueError:
                 #force an all or nothing senario in terms of bad values
-                return []
+                raise
         return parsed
 
     def expand_day_range(self, days):
         if len(days) == 1:
             if not self.is_valid_day(days):
-                raise ValueError
+                raise ValueError("The specified day is invalid")
             return [days]
 
         days = days.split('-')
@@ -418,22 +414,22 @@ class ScheduleParser:
             return []
 
         if not self.is_valid_day(days[0]) or not self.is_valid_day(days[1]):
-            raise ValueError
+            raise ValueError("The specificed day is invalid")
         # return a slice of valid days
         return VALID_DAYS[VALID_DAYS.index(days[0]):VALID_DAYS.index(days[1])+1]
 
     def is_valid(self, schedule):
         # off and on are both required if either is present
         if 'off' in schedule and 'on' not in schedule:
-            return False
+            raise ValueError("On tag is missing or malformed")
         elif 'on' in schedule and 'off' not in schedule:
-            return False
+            raise ValueError("Off tag is missing or malformed")
         # validate custom on/off hours
         if 'off' in schedule and 'on' in schedule:
             if not self.is_valid_hours(schedule['off']):
-                return False
+                raise ValueError("The specificed Off hour value is invalid")
             if not self.is_valid_hours(schedule['on']):
-                return False
+                raise ValueError("The specificed On hour value is invalid")
         return True
 
     def is_valid_hours(self, hours):
