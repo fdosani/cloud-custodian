@@ -350,6 +350,53 @@ class OnHour(Time):
 
 
 class ScheduleParser:
+    """
+    The ScheduleParser class parses instances/asgs to define a custom off hours
+    schedule via the offhours tag.
+
+    At the minimum the ``on`` and ``off`` tags are required. Each of these must
+    be seperated by a ``;`` in the format described below.
+
+    **Schedule format**::
+
+        # up mon-fri from 7am-7pm; eastern time
+        off=(M-F,19);on=(M-F,7)
+        # up mon-fri from 6am-9pm; up sun from 10am-6pm; pacific time
+        off=[(M-F,21),(U,18)];on=[(M-F,6),(U,10)];tz=pt
+
+    **Possible values**:
+
+        +------------+----------------------+
+        | field      | values               |
+        +============+======================+
+        | days       | M, T, W, H, F, S, U  |
+        +------------+----------------------+
+        | hours      | 1, 2, 3, ..., 22, 23 |
+        +------------+----------------------+
+
+        Days can be specified in a range (ex. M-F).
+
+    If the timezone is not supplied, it is assumed ET (eastern time), but this
+    default can be configurable.
+
+    **Parser output**:
+
+    The schedule parser will return a ``dict`` or ``None`` (if the schedule is
+    invalid)::
+
+        # off=[(M-F,21),(U,18)];on=[(M-F,6),(U,10)];tz=pt
+        {
+          off: [
+            { days: "M-F", hour: 21 },
+            { days: "U", hour: 18 }
+          ],
+          on: [
+            { days: "M-F", hour: 6 },
+            { days: "U", hour: 10 }
+          ],
+          tz: "pt"
+        }
+    """
 
     cache = {}
 
