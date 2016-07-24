@@ -25,6 +25,7 @@ allowedProperties and enum extension).
 All filters and actions are annotated with schema typically using
 the utils.type_schema function.
 """
+from collections import Counter
 import json
 import logging
 
@@ -43,6 +44,15 @@ def validate(data):
 
     errors = list(validator.iter_errors(data))
     if not errors:
+        counter = Counter([p['name'] for p in data.get('policies')])
+        dupes = []
+        for k, v in counter.items():
+            if v > 1:
+                dupes.append(k)
+        if dupes:
+            return [ValueError(
+                "Only one policy with a given name allowed, duplicates: %s" % (
+                    ", ".join(dupes)))]
         return []
     try:
         return [specific_error(errors[0])]
@@ -67,7 +77,7 @@ def specific_error(error):
     """
     if error.validator not in ('anyOf', 'oneOf'):
         return error
-        
+
     r = t = None
     if isinstance(error.instance, dict):
         t = error.instance.get('type')
@@ -135,9 +145,11 @@ def generate(resource_types=()):
                 'name': {
                     'type': 'string',
                     'pattern': "^[A-z][A-z0-9]*(-[A-z0-9]*[A-z][A-z0-9]*)*$"},
+                'region': {'type': 'string'},
                 'resource': {'type': 'string'},
+                'max-resources': {'type': 'integer'},
                 'comment': {'type': 'string'},
-                'comments': {'type': 'string'},                
+                'comments': {'type': 'string'},
                 'description': {'type': 'string'},
                 'tags': {'type': 'array', 'items': {'type': 'string'}},
                 'mode': {'$ref': '#/definitions/policy-mode'},
@@ -160,7 +172,7 @@ def generate(resource_types=()):
                         'minProperties': 1,
                         'maxProperties': 1}}
             },
-        },            
+        },
         'policy-mode': {
             'type': 'object',
             'required': ['type'],
@@ -183,7 +195,7 @@ def generate(resource_types=()):
                              'event': {'type': 'string'}}}]
                     }}
             },
-        },    
+        },
     }
 
     resource_refs = []
@@ -192,9 +204,9 @@ def generate(resource_types=()):
             continue
         resource_refs.append(
             process_resource(type_name, resource_type, resource_defs))
-        
+
     schema = {
-        '$schema': 'http://json-schema.org/schema#',        
+        '$schema': 'http://json-schema.org/schema#',
         'id': 'http://schema.cloudcustodian.io/v0/custodian.json',
         'definitions': definitions,
         'type': 'object',
@@ -209,13 +221,13 @@ def generate(resource_types=()):
                 }
             }
     }
-    
+
     return schema
 
 
 def process_resource(type_name, resource_type, resource_defs):
     r = resource_defs.setdefault(type_name, {'actions': {}, 'filters': {}})
-    
+
     seen_actions = set()  # Aliases get processed once
     action_refs = []
     for action_name, a in resource_type.action_registry.items():
@@ -227,11 +239,11 @@ def process_resource(type_name, resource_type, resource_defs):
         action_refs.append(
             {'$ref': '#/definitions/resources/%s/actions/%s' % (
                 type_name, action_name)})
-        
+
     # one word action shortcuts
     action_refs.append(
         {'enum': resource_type.action_registry.keys()})
-    
+
     nested_filter_refs = []
     filters_seen = set()
     for k, v in sorted(resource_type.filter_registry.items()):
@@ -252,7 +264,7 @@ def process_resource(type_name, resource_type, resource_defs):
             continue
         else:
             filters_seen.add(f)
-                
+
         if filter_name in ('or', 'and'):
             continue
         elif filter_name == 'value':
@@ -282,7 +294,7 @@ def process_resource(type_name, resource_type, resource_defs):
     # one word filter shortcuts
     filter_refs.append(
         {'enum': resource_type.filter_registry.keys()})
-    
+
     resource_policy = {
         'allOf': [
             {'$ref': '#/definitions/policy'},
@@ -297,10 +309,9 @@ def process_resource(type_name, resource_type, resource_defs):
             ]
     }
 
-
     if type_name == 'ec2':
         resource_policy['allOf'][1]['properties']['query'] = {}
-    
+
     r['policy'] = resource_policy
     return {'$ref': '#/definitions/resources/%s/policy' % type_name}
 

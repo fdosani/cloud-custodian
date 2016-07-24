@@ -15,6 +15,10 @@
 import argparse
 import logging
 import os
+import pdb
+import sys
+import traceback
+
 
 from c7n import commands, resources
 
@@ -64,7 +68,7 @@ def setup_parser():
     report.set_defaults(command=commands.report)
     _default_options(report)
     report.add_argument(
-        '--days', type=int, default=1,
+        '--days', type=float, default=1,
         help="Number of days of history to consider")
     report.add_argument(
         '--raw', type=argparse.FileType('wb'),
@@ -73,6 +77,12 @@ def setup_parser():
     logs = subs.add_parser('logs')
     logs.set_defaults(command=commands.logs)
     _default_options(logs)
+
+    version = subs.add_parser('version')
+    version.set_defaults(command=commands.cmd_version)
+    version.add_argument(
+        "-v", "--verbose", action="store_true",
+        help="Verbose Logging")
 
     validate = subs.add_parser('validate')
     validate.set_defaults(command=commands.validate)
@@ -116,12 +126,6 @@ def main():
     except Exception:
         if not options.debug:
             raise
-        import traceback
-        import pdb
-        import sys
         traceback.print_exc()
         pdb.post_mortem(sys.exc_info()[-1])
 
-
-if __name__ == '__main__':
-    main()

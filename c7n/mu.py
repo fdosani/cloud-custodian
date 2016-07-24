@@ -26,6 +26,7 @@ import json
 import logging
 import os
 import sys
+import time
 import platform
 import tempfile
 import zipfile
@@ -39,7 +40,7 @@ import c7n
 
 # Static event mapping to help simplify cwe rules creation
 from c7n.cwe import CloudWatchEvents
-from c7n.utils import parse_s3
+from c7n.utils import parse_s3, local_session
 
 
 log = logging.getLogger('custodian.lambda')
@@ -124,7 +125,7 @@ class PythonPackageArchive(object):
 
     def add_file(self, src, dest):
         self._zip_file.write(src, dest)
-        
+
     def add_contents(self, dest, contents):
         if not isinstance(dest, zipfile.ZipInfo):
             dest = zinfo(dest)
@@ -172,7 +173,7 @@ def custodian_archive(skip=None):
     """Create a lambda code archive for running custodian."""
 
     # Some aggressive shrinking
-    required = ["concurrent", "yaml", "pkg_resources"]
+    required = ["concurrent", "yaml", "pkg_resources", "skew"]
     host_platform = platform.uname()[0]
 
     def lib_filter(root, dirs, files):
@@ -208,11 +209,12 @@ class LambdaManager(object):
             for f in rp.get('Functions', []):
                 if not prefix:
                     yield f
-                if f['FunctionName'].startswith(prefix):
+                elif f['FunctionName'].startswith(prefix):
                     yield f
 
     def publish(self, func, alias=None, role=None, s3_uri=None):
-        result, changed = self._create_or_update(func, role, s3_uri, qualifier=alias)
+        result, changed = self._create_or_update(
+            func, role, s3_uri, qualifier=alias)
         func.arn = result['FunctionArn']
         if alias and changed:
             func.alias = self.publish_alias(result, alias)
@@ -241,7 +243,7 @@ class LambdaManager(object):
     def metrics(self, funcs, start, end, period=5*60):
 
         def func_metrics(f):
-            metrics = self.session_factory().client('cloudwatch')
+            metrics = local_session(self.session_factory).client('cloudwatch')
             values = {}
             for m in ('Errors', 'Invocations', 'Durations', 'Throttles'):
                 values[m] = metrics.get_metric_statistics(
@@ -669,24 +671,28 @@ class CloudWatchEventSource(object):
         return False
 
     def __repr__(self):
-        return "<CWEvent Type:%s Sources:%s Events:%s>" % (
+        return "<CWEvent Type:%s Events:%s>" % (
             self.data.get('type'),
-            ', '.join(self.data.get('sources', [])),
-            ', '.join(self.data.get('events', [])))
+            ', '.join(map(str, self.data.get('events', []))))
 
     def resolve_cloudtrail_payload(self, payload):
         ids = []
         sources = self.data.get('sources', [])
-
+        events = []
         for e in self.data.get('events'):
-            event_info = CloudWatchEvents.get(e)
-            if event_info is None:
-                continue
+            if not isinstance(e, dict):
+                events.append(e)
+                event_info = CloudWatchEvents.get(e)
+                if event_info is None:
+                    continue
+            else:
+                event_info = e
+                events.append(e['event'])
             sources.append(event_info['source'])
 
         payload['detail'] = {
             'eventSource': list(set(sources)),
-            'eventName': self.data.get('events', [])}
+            'eventName': events}
 
     def render_event_pattern(self):
         event_type = self.data.get('type')
@@ -832,11 +838,11 @@ class BucketNotification(object):
         s3 = self.session.client('s3')
         notifies, found = self._get_notifies(s3, func)
         notifies.pop('ResponseMetadata', None)
-        func_arn = func['FunctionArn']
+        func_arn = func.arn
         if func_arn.rsplit(':', 1)[-1].isdigit():
             func_arn = func_arn.rsplit(':', 1)[0]
         n_params = {
-            'Id': func['FunctionName'],
+            'Id': func.name,
             'LambdaFunctionArn': func_arn,
             'Events': self.data.get('events', ['s3:ObjectCreated:*'])}
         if self.data.get('filters'):
@@ -852,7 +858,7 @@ class BucketNotification(object):
 
         lambda_client = self.session.client('lambda')
         params = dict(
-            FunctionName=func['FunctionName'],
+            FunctionName=func.name,
             StatementId=self.bucket['Name'],
             Action='lambda:InvokeFunction',
             Principal='s3.amazonaws.com')
@@ -896,6 +902,8 @@ class CloudWatchLogSubscription(object):
     """ Subscribe a lambda to a log group[s]
     """
 
+    iam_delay = 1.5
+
     def __init__(self, session_factory, log_groups, filter_pattern):
         self.log_groups = log_groups
         self.filter_pattern = filter_pattern
@@ -916,7 +924,9 @@ class CloudWatchLogSubscription(object):
                     SourceArn=group['arn'],
                     Action='lambda:InvokeFunction',
                     Principal='logs.%s.amazonaws.com' % region)
-                log.debug("Added lambda invoke log group permission")
+                log.debug("Added lambda ipo nvoke log group permission")
+                # iam eventual consistency and propagation
+                time.sleep(self.iam_delay)
             except ClientError as e:
                 if e.response['Error']['Code'] != 'ResourceConflictException':
                     raise

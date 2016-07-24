@@ -13,45 +13,88 @@
 # limitations under the License.
 import logging
 
-from c7n.actions import ActionRegistry
-from c7n.filters import FilterRegistry, Filter
-
-from c7n.manager import ResourceManager, resources
+from c7n.filters import Filter, CrossAccountAccessFilter
+from c7n.manager import resources
+from c7n.query import QueryResourceManager
 from c7n.utils import local_session, type_schema
 
 log = logging.getLogger('custodian.kms')
 
-filters = FilterRegistry('kms.filters')
-actions = ActionRegistry('kms.actions')
+
+class KeyBase(object):
+
+    def augment(self, resources):
+        client = local_session(
+            self.session_factory).client('kms')
+        for r in resources:
+            key_id = r.get('AliasArn') or r.get('KeyArn')
+            info = client.describe_key(KeyId=key_id)['KeyMetadata']
+            r.update(info)
+        return resources
 
 
 @resources.register('kms')
-class KMS(ResourceManager):
+class KeyAlias(KeyBase, QueryResourceManager):
 
-    filter_registry = filters
-    action_registry = actions
+    class Meta(object):
+        service = 'kms'
+        type = 'key-alias'
+        enum_spec = ('list_aliases', 'Aliases', None)
+        name = "AliasName"
+        id = "AliasArn"
+        dimension = None
 
-    def resources(self):
-        c = self.session_factory().client('kms')
-        query = self.resource_query()  # FIXME: Not used
-        self.log.info("Querying kms keys")
-        keys = c.list_aliases()['Aliases']
-        original_count = len(keys)
-        keys = [k for k in keys if 'TargetKeyId' in k]
-        log.debug(
-            "Filtered aliases without targets from %d to %d" % (
-                original_count, len(keys)))
-        return self.filter_resources(keys)
+    resource_type = Meta
+
+    def augment(self, resources):
+        resources = [r for r in resources if 'TargetKeyId' in r]
+        return super(KeyAlias, self).augment(resources)
 
 
-@filters.register('grant-count')
+@resources.register('kms-key')
+class Key(KeyBase, QueryResourceManager):
+
+    class Meta(object):
+        service = 'kms'
+        type = "key"
+        enum_spec = ('list_keys', 'Keys', None)
+        name = "KeyId"
+        id = "KeyArn"
+        dimension = None
+
+    resource_type = Meta
+
+
+@Key.filter_registry.register('cross-account')
+@KeyAlias.filter_registry.register('cross-account')
+class KMSCrossAccountAccessFilter(CrossAccountAccessFilter):
+
+    def process(self, resources, event=None):
+        def _augment(r):
+            client = local_session(
+                self.manager.session_factory).client('kms')
+            key_id = r.get('TargetKeyId', r.get('KeyId'))
+            assert key_id, "Invalid key resources %s" % r
+            r['Policy'] = client.get_key_policy(
+                KeyId=key_id, PolicyName='default')['Policy']
+            return r
+
+        self.log.debug("fetching policy for %d kms keys" % len(resources))
+        with self.executor_factory(max_workers=1) as w:
+            resources = filter(None, w.map(_augment, resources))
+
+        return super(KMSCrossAccountAccessFilter, self).process(
+            resources, event)
+
+
+@KeyAlias.filter_registry.register('grant-count')
 class GrantCount(Filter):
 
     schema = type_schema(
         'grant-count', min={'type': 'integer', 'minimum': 0})
 
     def process(self, keys, event=None):
-        with self.executor_factory(max_workers=10) as w:
+        with self.executor_factory(max_workers=3) as w:
             return filter(None, (w.map(self.process_key, keys)))
 
     def process_key(self, key):

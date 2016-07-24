@@ -10,7 +10,8 @@ develop:
 	source bin/activate && python setup.py develop
 
 coverage:
-	AWS_DEFAULT_REGION=us-east-1 ./bin/nosetests -s -v --with-coverage --cover-html --cover-package=c7n --cover-html-dir=cover tests
+	rm -Rf .coverage
+	AWS_DEFAULT_REGION=us-east-1 ./bin/nosetests -s -v --with-coverage --cover-html --cover-package=c7n --cover-html-dir=cover --cover-inclusive tests
 
 ttest:
 	AWS_DEFAULT_REGION=us-east-1 ./bin/nosetests -s -v --with-timer tests

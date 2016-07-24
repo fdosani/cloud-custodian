@@ -13,56 +13,17 @@
 # limitations under the License.
 """
 Elastic Load Balancers
-----------------------
-
-
-TODO
-####
-
-- SSL Policy enforcement
-- Empty instance waste collection
-
-Actions
-#######
-
-filters:
-  - Instances: []
-actions:
-  - type: mark-for-op
-    op: 'delete'
-    days: 7
-
-filters:
-  - type: marked-for-op
-    op: delete
-actions:
-  - delete
-
-
-Filters
-#######
-
-In addition to value filters
-
-.. code-block:: yaml
-
-  filters:
-    # Matches when the backend listener and health check are
-    # not on the same protocol
-    - healthcheck-protocol-mismatch
-
 """
 from concurrent.futures import as_completed
 import logging
-import itertools
 
 from botocore.exceptions import ClientError
 
 from c7n.actions import ActionRegistry, BaseAction
 from c7n.filters import Filter, FilterRegistry, FilterValidationError
-from c7n.tags import (
-    TagCountFilter, TagActionFilter, TagDelayedAction as _TagDelayedAction)
-from c7n.manager import ResourceManager, resources
+from c7n import tags
+from c7n.manager import resources
+from c7n.query import QueryResourceManager
 from c7n.utils import local_session, chunks, type_schema
 
 log = logging.getLogger('custodian.elb')
@@ -71,48 +32,21 @@ filters = FilterRegistry('elb.filters')
 actions = ActionRegistry('elb.actions')
 
 
-filters.register('tag-count', TagCountFilter)
-filters.register('marked-for-op', TagActionFilter)
+filters.register('tag-count', tags.TagCountFilter)
+filters.register('marked-for-op', tags.TagActionFilter)
 
 
 @resources.register('elb')
-class ELB(ResourceManager):
+class ELB(QueryResourceManager):
 
+    resource_type = "aws.elb.loadbalancer"
     filter_registry = filters
     action_registry = actions
 
-    def resources(self):
-        if self._cache.load():
-            elbs = self._cache.get(
-                {'region': self.config.region, 'resource': 'elb'})
-            if elbs is not None:
-                self.log.debug("Using cached elb: %d" % (
-                    len(elbs)))
-                return self.filter_resources(elbs)
-
-        c = self.session_factory().client('elb')
-        p = c.get_paginator('describe_load_balancers')
-        results = p.paginate()
-        elbs= list(itertools.chain(
-            *[rp['LoadBalancerDescriptions'] for rp in results]))
-        _elb_tags(elbs, self.session_factory, self.executor_factory)
-        self._cache.save(
-            {'region': self.config.region, 'resource': 'elb'}, elbs)
-
-        return self.filter_resources(elbs)
-
-    def get_resources(self, resource_ids):
-        c = local_session(self.session_factory).client('elb')
-        try:
-            return _elb_tags(
-                c.describe_load_balancers(
-                    LoadBalancerNames=resource_ids).get(
-                        'LoadBalancerDescriptions', ()),
-                self.session_factory, self.executor_factory)
-        except ClientError as e:
-            if e.response['Error']['Code'] == "LoadBalancerNotFound":
-                return []
-            raise
+    def augment(self, resources):
+        _elb_tags(
+            resources, self.session_factory, self.executor_factory)
+        return resources
 
 
 def _elb_tags(elbs, session_factory, executor_factory):
@@ -133,13 +67,13 @@ def _elb_tags(elbs, session_factory, executor_factory):
 
 
 @actions.register('mark-for-op')
-class TagDelayedAction(_TagDelayedAction):
+class TagDelayedAction(tags.TagDelayedAction):
 
     schema = type_schema(
-        'mark-for-op', rinherit=_TagDelayedAction.schema,
+        'mark-for-op', rinherit=tags.TagDelayedAction.schema,
         ops={'enum': ['delete', 'set-ssl-listener-policy']})
 
-    batch_size = 20
+    batch_size = 1
 
     def process_resource_set(self, resource_set, tags):
         client = local_session(self.manager.session_factory).client('elb')
@@ -148,13 +82,39 @@ class TagDelayedAction(_TagDelayedAction):
             Tags=tags)
 
 
+@actions.register('tag')
+class Tag(tags.Tag):
+
+    batch_size = 1
+
+    def process_resource_set(self, resource_set, tags):
+        client = local_session(
+            self.manager.session_factory).client('elb')
+        client.add_tags(
+            LoadBalancerNames=[r['LoadBalancerName'] for r in resource_set],
+            Tags=tags)
+
+
+@actions.register('remove-tag')
+class RemoveTag(tags.RemoveTag):
+
+    batch_size = 1
+
+    def process_resource_set(self, resource_set, tag_keys):
+        client = local_session(
+            self.manager.session_factory).client('elb')
+        client.remove_tags(
+            LoadBalancerNames=[r['LoadBalancerName'] for r in resource_set],
+            Tags=[{'Key': k for k in tag_keys}])
+
+
 @actions.register('delete')
 class Delete(BaseAction):
 
     schema = type_schema('delete')
 
     def process(self, load_balancers):
-        with self.executor_factory(max_workers=3) as w:
+        with self.executor_factory(max_workers=2) as w:
             list(w.map(self.process_elb, load_balancers))
 
     def process_elb(self, elb):
@@ -189,11 +149,16 @@ class SetSslListenerPolicy(BaseAction):
         lb_name = elb['LoadBalancerName']
         policy_attributes = [{'AttributeName': attr, 'AttributeValue': 'true'}
             for attr in attrs]
-        client.create_load_balancer_policy(
-            LoadBalancerName=lb_name,
-            PolicyName=policy_name,
-            PolicyTypeName='SSLNegotiationPolicyType',
-            PolicyAttributes=policy_attributes)
+
+        try:
+            client.create_load_balancer_policy(
+                LoadBalancerName=lb_name,
+                PolicyName=policy_name,
+                PolicyTypeName='SSLNegotiationPolicyType',
+                PolicyAttributes=policy_attributes)
+        except ClientError as e:
+            if e.response['Error']['Code'] != 'DuplicatePolicyName':
+                raise
 
         # Apply it to all SSL listeners.
         for ld in elb['ListenerDescriptions']:
@@ -227,6 +192,7 @@ class SSLPolicyFilter(Filter):
 
     filters:
       - type: ssl-policy
+
         whitelist: []
         blacklist:
         - "Protocol-SSLv2"
@@ -269,16 +235,18 @@ class SSLPolicyFilter(Filter):
         whitelist = set(self.data.get('whitelist', []))
         blacklist = set(self.data.get('blacklist', []))
 
+        invalid_elbs = []
+
         if blacklist:
-            invalid_elbs = [
-                elb for elb, active_policies in
-                active_policy_attribute_tuples
-                if len(blacklist.intersection(active_policies))]
+            for elb, active_policies in active_policy_attribute_tuples:
+                if len(blacklist.intersection(active_policies)) > 0:
+                    elb["ProhibitedPolicies"] = list(blacklist.intersection(active_policies))
+                    invalid_elbs.append(elb)
         elif whitelist:
-            invalid_elbs = [
-                elb for elb, active_policies in
-                active_policy_attribute_tuples
-                if len(set(active_policies).difference(whitelist))]
+            for elb, active_policies in active_policy_attribute_tuples:
+                if len(set(active_policies).difference(whitelist)) > 0:
+                    elb["ProhibitedPolicies"] = list(set(active_policies).difference(whitelist))
+                    invalid_elbs.append(elb)
         return invalid_elbs
 
     def create_elb_active_policy_attribute_tuples(self, elbs):
@@ -344,7 +312,8 @@ class SSLPolicyFilter(Filter):
                     LoadBalancerName=elb_name,
                     PolicyNames=policy_names)['PolicyDescriptions']
             except ClientError as e:
-                if e.response['Error']['Code'] == "LoadBalancerNotFound":
+                if e.response['Error']['Code'] in [
+                        'LoadBalancerNotFound', 'PolicyNotFound']:
                     continue
                 raise
             active_lb_policies = []

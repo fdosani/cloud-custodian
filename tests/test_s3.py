@@ -14,16 +14,17 @@
 import json
 import shutil
 import tempfile
+import time
 from unittest import TestCase
 
 from botocore.exceptions import ClientError
 
 from c7n.executor import MainThreadExecutor
 from c7n.resources import s3
-from c7n.mu import LambdaManager
+from c7n.mu import LambdaManager, PolicyLambda
 from c7n.ufuncs import s3crypt
 
-from common import BaseTest
+from common import BaseTest, event_data
 
 
 class RestoreCompletionTest(TestCase):
@@ -63,6 +64,13 @@ def destroyBucket(client, bucket):
     client.delete_bucket(Bucket=bucket)
 
 
+def destroyVersionedBucket(client, bucket):
+    for o in client.list_object_versions(Bucket=bucket).get('Versions'):
+        client.delete_object(
+            Bucket=bucket, Key=o['Key'], VersionId=o['VersionId'])
+    client.delete_bucket(Bucket=bucket)
+
+
 def generateBucketContents(s3, bucket, contents=None):
     default_contents = {
         'home.txt': 'hello',
@@ -84,7 +92,7 @@ class S3Test(BaseTest):
     def test_multipart_large_file(self):
         self.patch(s3.S3, 'executor_factory', MainThreadExecutor)
         self.patch(
-            s3.EncryptExtantKeys, 'executor_factory', MainThreadExecutor)        
+            s3.EncryptExtantKeys, 'executor_factory', MainThreadExecutor)
         self.patch(s3, 'S3_AUGMENT_TABLE', [])
         self.patch(s3, 'MAX_COPY_SIZE', (1024 * 1024 * 6.1))
         session_factory = self.replay_flight_data('test_s3_multipart_file')
@@ -100,7 +108,7 @@ class S3Test(BaseTest):
                 self.d = d
                 self.len = length
                 self.counter = length
-                
+
             def read(self, size):
                 if self.counter == 0:
                     return ""
@@ -119,7 +127,7 @@ class S3Test(BaseTest):
 
             def tell(self):
                 return self.len - self.counter
-            
+
         size = 1024 * 1024 * 16
         client.put_object(
             Bucket=bname, Key=key,
@@ -185,7 +193,7 @@ class S3Test(BaseTest):
             s3.MissingPolicyStatementFilter, 'executor_factory',
             MainThreadExecutor)
         self.patch(s3, 'S3_AUGMENT_TABLE', [
-            ('get_bucket_policy',  'Policy', None, None),
+            ('get_bucket_policy',  'Policy', None, 'Policy'),
         ])
         session_factory = self.replay_flight_data('test_s3_has_statement')
         bname = "custodian-policy-test"
@@ -213,7 +221,7 @@ class S3Test(BaseTest):
             'filters': [
                 {'Name': bname},
                 {'type': 'has-statement',
-                 'statement-ids': ['RequireEncryptedPutObject']}]},
+                 'statement_ids': ['Zebra']}]},
             session_factory=session_factory)
         resources = p.run()
         self.assertEqual(len(resources), 1)
@@ -224,7 +232,7 @@ class S3Test(BaseTest):
             s3.MissingPolicyStatementFilter, 'executor_factory',
             MainThreadExecutor)
         self.patch(s3, 'S3_AUGMENT_TABLE', [
-            ('get_bucket_policy',  'Policy', None, None),
+            ('get_bucket_policy',  'Policy', None, 'Policy'),
         ])
         session_factory = self.replay_flight_data('test_s3_missing_policy')
         bname = "custodian-encrypt-test"
@@ -259,7 +267,7 @@ class S3Test(BaseTest):
 
     def test_encrypt_policy(self):
         self.patch(s3, 'S3_AUGMENT_TABLE', [
-            ('get_bucket_policy',  'Policy', None, None),
+            ('get_bucket_policy',  'Policy', None, 'Policy'),
         ])
         session_factory = self.replay_flight_data('test_s3_encrypt_policy')
         bname = "custodian-encrypt-test"
@@ -285,10 +293,38 @@ class S3Test(BaseTest):
         else:
             self.fail("Encryption required policy")
 
+    def test_remove_policy_none_extant(self):
+        self.patch(s3, 'S3_AUGMENT_TABLE', [
+            ('get_bucket_policy',  'Policy', None, 'Policy'),
+        ])
+        self.patch(s3.S3, 'executor_factory', MainThreadExecutor)
+        session_factory = self.replay_flight_data(
+            'test_s3_remove_empty_policy')
+        bname = "custodian-policy-test"
+        session = session_factory()
+        client = session.client('s3')
+        client.create_bucket(Bucket=bname)
+        self.addCleanup(destroyBucket, client, bname)
+        p = self.load_policy({
+            'name': 'remove-policy',
+            'resource': 's3',
+            'filters': [{'Name': bname}],
+            'actions': [
+                {'type': 'remove-statements', 'statement_ids': [
+                    'Zebra', 'Moon']}],
+            }, session_factory=session_factory)
+        resources = p.run()
+        self.assertEqual(len(resources), 1)
+        self.assertRaises(ClientError, client.get_bucket_policy, Bucket=bname)
+
     def test_remove_policy(self):
         self.patch(s3, 'S3_AUGMENT_TABLE', [
-            ('get_bucket_policy',  'Policy', None, None),
+            ('get_bucket_policy',  'Policy', None, 'Policy'),
         ])
+        self.patch(s3.S3, 'executor_factory', MainThreadExecutor)
+        self.patch(
+            s3.RemovePolicyStatement, 'executor_factory', MainThreadExecutor)
+
         session_factory = self.replay_flight_data('test_s3_remove_policy')
         bname = "custodian-policy-test"
         session = session_factory()
@@ -327,6 +363,53 @@ class S3Test(BaseTest):
             {'name': 'attach-encrypt',
              'resource': 's3',
              'actions': [{'type': 'attach-encrypt'}]})
+
+    def test_create_bucket_event(self):
+        self.patch(s3, 'S3_AUGMENT_TABLE', [
+            ('get_bucket_policy',  'Policy', None, 'Policy'),
+        ])
+        self.patch(s3.S3, 'executor_factory', MainThreadExecutor)
+        session_factory = self.replay_flight_data('test_s3_create')
+        bname = 'custodian-create-bucket-v4'
+        session = session_factory()
+        client = session.client('s3')
+
+        client.create_bucket(Bucket=bname)
+        self.addCleanup(destroyBucket, client, bname)
+
+        p = self.load_policy({
+            'name': 'bucket-create-v2',
+            'resource': 's3',
+            'mode': {
+                'type': 'cloudtrail',
+                'role': 'arn:aws:iam::619193117841:role/CustodianDemoRole',
+                'events': ['CreateBucket'],
+                },
+            'actions': [
+                'encryption-policy']}, session_factory=session_factory)
+        p.push(event_data('event-cloud-trail-create-bucket.json'), None)
+
+        try:
+            result = client.get_bucket_policy(Bucket=bname)
+        except:
+            self.fail("Could not get bucket policy")
+
+        self.assertTrue('Policy' in result)
+        policy = json.loads(result['Policy'])
+        self.assertEqual(
+            policy,
+            {u'Statement': [
+                {u'Action': u's3:PutObject',
+                 u'Condition': {
+                     u'StringNotEquals': {
+                         u's3:x-amz-server-side-encryption': [
+                             u'AES256',
+                             u'aws:kms']}},
+                 u'Effect': u'Deny',
+                 u'Principal': u'*',
+                 u'Resource': u'arn:aws:s3:::custodian-create-bucket-v4/*',
+                 u'Sid': u'RequireEncryptedPutObject'}],
+             u'Version': u'2012-10-17'})
 
     def test_attach_encrypt(self):
         self.patch(s3, 'S3_AUGMENT_TABLE', [])
@@ -368,6 +451,58 @@ class S3Test(BaseTest):
         info = client.head_object(Bucket=bname, Key='hello-world.txt')
         self.assertTrue('ServerSideEncryption' in info)
 
+    def test_encrypt_versioned_bucket(self):
+        self.patch(s3, 'S3_AUGMENT_TABLE', [
+            ('get_bucket_versioning', 'Versioning', None, None)])
+
+        self.patch(s3.S3, 'executor_factory', MainThreadExecutor)
+        self.patch(
+            s3.EncryptExtantKeys, 'executor_factory', MainThreadExecutor)
+        session_factory = self.replay_flight_data('test_s3_encrypt_versioned')
+        bname = "custodian-encrypt-test"
+
+        session = session_factory()
+        client = session.client('s3')
+        client.create_bucket(Bucket=bname)
+        client.put_bucket_versioning(
+            Bucket=bname,
+            VersioningConfiguration={'Status': 'Enabled'})
+        self.addCleanup(destroyVersionedBucket, client, bname)
+        generateBucketContents(session.resource('s3'), bname)
+
+        p = self.load_policy({
+            'name': 'encrypt-keys',
+            'resource': 's3',
+            'filters': [{'Name': bname}],
+            'actions': ['encrypt-keys']}, session_factory=session_factory)
+        resources = p.run()
+
+        self.assertTrue(
+            len(client.list_object_versions(Bucket=bname)['Versions']) == 3)
+        self.assertTrue(
+            'ServerSideEncryption' in client.head_object(
+                Bucket=bname, Key='home.txt'))
+
+    def test_encrypt_key_empty_bucket(self):
+        self.patch(s3, 'S3_AUGMENT_TABLE', [])
+        self.patch(
+            s3.EncryptExtantKeys, 'executor_factory', MainThreadExecutor)
+        session_factory = self.replay_flight_data('test_s3_encrypt_empty')
+        bname = "custodian-encrypt-test"
+
+        session = session_factory()
+        client = session.client('s3')
+        client.create_bucket(Bucket=bname)
+        self.addCleanup(destroyBucket, client, bname)
+
+        p = self.load_policy({
+            'name': 'encrypt-keys',
+            'resource': 's3',
+            'filters': [{'Name': bname}],
+            'actions': ['encrypt-keys']}, session_factory=session_factory)
+        resources = p.run()
+        self.assertEqual(len(resources), 1)
+
     def test_encrypt_keys(self):
         self.patch(s3, 'S3_AUGMENT_TABLE', [])
         session_factory = self.replay_flight_data('test_s3_encrypt')
@@ -402,9 +537,9 @@ class S3Test(BaseTest):
         client = session.client('s3')
         client.create_bucket(Bucket=bname)
         self.addCleanup(destroyBucket, client, bname)
-        
+
         public = 'http://acs.amazonaws.com/groups/global/AllUsers'
-    
+
         client.put_bucket_acl(
             Bucket=bname,
             AccessControlPolicy={
@@ -438,8 +573,8 @@ class S3Test(BaseTest):
                   'permissions': ['WRITE']}]},
             session_factory=session_factory)
         resources = p.run()
-        self.assertEqual(len(resources), 1)        
-        
+        self.assertEqual(len(resources), 1)
+
     def test_global_grants_filter_and_remove(self):
         self.patch(s3, 'S3_AUGMENT_TABLE', [
             ('get_bucket_acl', 'Acl', None, None)
@@ -450,7 +585,7 @@ class S3Test(BaseTest):
         session = session_factory()
         client = session.client('s3')
         client.create_bucket(Bucket=bname)
-        
+
         public = 'http://acs.amazonaws.com/groups/global/AllUsers'
         client.put_bucket_acl(
             Bucket=bname,
