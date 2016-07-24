@@ -39,6 +39,7 @@ Actions:
 """
 from botocore.client import Config
 from botocore.exceptions import ClientError
+from botocore.vendored.requests.exceptions import SSLError
 from concurrent.futures import as_completed
 
 import functools
@@ -48,12 +49,13 @@ import logging
 import math
 import os
 import time
+import ssl
 
 from c7n import executor
 from c7n.actions import ActionRegistry, BaseAction
-from c7n.filters import FilterRegistry, Filter
+from c7n.filters import FilterRegistry, Filter, CrossAccountAccessFilter
 from c7n.manager import resources
-from c7n.query import QueryResourceManager
+from c7n.query import QueryResourceManager, ResourceQuery
 from c7n.utils import chunks, local_session, set_annotation, type_schema
 
 """
@@ -68,13 +70,14 @@ filters = FilterRegistry('s3.filters')
 actions = ActionRegistry('s3.actions')
 
 
-MAX_COPY_SIZE = 1024 * 1024 * 1024 * 5
+MAX_COPY_SIZE = 1024 * 1024 * 1024 * 2
 
 
 @resources.register('s3')
 class S3(QueryResourceManager):
 
-    resource_type = "aws.s3.bucket"
+    class resource_type(ResourceQuery.resolve("aws.s3.bucket")):
+        dimension = 'BucketName'
 
     executor_factory = executor.ThreadPoolExecutor
     filter_registry = filters
@@ -93,10 +96,11 @@ class S3(QueryResourceManager):
             results = filter(None, results)
             return results
 
+
 S3_AUGMENT_TABLE = (
     ('get_bucket_location', 'Location', None, None),
     ('get_bucket_tagging', 'Tags', [], 'TagSet'),
-    ('get_bucket_policy',  'Policy', None, None),
+    ('get_bucket_policy',  'Policy', None, 'Policy'),
     ('get_bucket_acl', 'Acl', None, None),
     ('get_bucket_replication', 'Replication', None, None),
     ('get_bucket_versioning', 'Versioning', None, None),
@@ -112,10 +116,8 @@ def assemble_bucket(item):
     """Assemble a document representing all the config state around a bucket.
     """
     factory, b = item
-
     s = factory()
     c = s.client('s3')
-
     # Bucket Location, Current Client Location, Default Location
     b_location = c_location = location = "us-east-1"
     methods = list(S3_AUGMENT_TABLE)
@@ -126,16 +128,21 @@ def assemble_bucket(item):
             v.pop('ResponseMetadata')
             if select is not None and select in v:
                 v = v[select]
-        except ClientError, e:
+        except (ssl.SSLError, SSLError) as e:
+            # Proxy issues?
+            log.warning("Bucket ssl error %s: %s %s",
+                        b['Name'], b.get('Location', 'unknown'),
+                        e)
+            return None
+        except ClientError as e:
             code =  e.response['Error']['Code']
             if code.startswith("NoSuch") or "NotFound" in code:
                 v = default
             elif code == 'PermanentRedirect':
-                # log.warning(e.response)
                 s = factory()
                 c = bucket_client(s, b)
                 # Requeue with the correct region given location constraint
-                methods.append((m, k))
+                methods.append((m, k, default, select))
                 continue
             else:
                 log.warning(
@@ -165,6 +172,30 @@ def bucket_client(session, b, kms=False):
     else:
         config = None
     return session.client('s3', region_name=region, config=config)
+
+
+@filters.register('cross-account')
+class S3CrossAccountFilter(CrossAccountAccessFilter):
+
+    def get_accounts(self):
+        """add in elb access by default
+
+        ELB Accounts by region http://goo.gl/a8MXxd
+        """
+        accounts = super(S3CrossAccountFilter, self).get_accounts()
+        return accounts.union(
+            ['127311923021',  # us-east-1
+             '797873946194',  # us-west-2
+             '027434742980',  # us-west-1
+             '156460612806',  # eu-west-1
+             '054676820928',  # eu-central-1
+             '114774131450',  # ap-southeast-1
+             '582318560864',  # ap-northeast-1
+             '783225319266',  # ap-southeast-2
+             '600734575887',  # ap-northeast-2
+             '507241528517',  # sa-east-1
+             '048591011584',  # gov-cloud-1
+             ])
 
 
 @filters.register('global-grants')
@@ -224,15 +255,15 @@ class HasStatementFilter(Filter):
         return filter(None, map(self.process_bucket, buckets))
 
     def process_bucket(self, b):
-        p = b['Policy']
+        p = b.get('Policy')
         if p is None:
             return b
-        p = json.loads(p['Policy'])
+        p = json.loads(p)
         required = list(self.data.get('statement_ids', []))
         statements = p.get('Statement', [])
         for s in list(statements):
-            if s.get('StatementId') in required:
-                required.remove(s['StatementId'])
+            if s.get('Sid') in required:
+                required.remove(s['Sid'])
         if not required:
             return b
         return None
@@ -248,22 +279,18 @@ class MissingPolicyStatementFilter(Filter):
         aliases=('missing-statement',),
         statement_ids={'type': 'array', 'items': {'type': 'string'}})
 
-    def process(self, buckets, event=None):
-        return filter(None, map(self, buckets))
-
     def __call__(self, b):
-        p = b['Policy']
+        p = b.get('Policy')
         if p is None:
             return b
 
-        p = json.loads(p['Policy'])
+        p = json.loads(p)
 
         required = list(self.data.get('statement_ids', []))
         statements = p.get('Statement', [])
-
         for s in list(statements):
-            if s.get('StatementId') in required:
-                required.remove(s['StatementId'])
+            if s.get('Sid') in required:
+                required.remove(s['Sid'])
         if not required:
             return False
         return True
@@ -291,11 +318,11 @@ class RemovePolicyStatement(BucketActionBase):
             return filter(None, list(results))
 
     def process_bucket(self, bucket):
-        p = bucket['Policy']
+        p = bucket.get('Policy')
         if p is None:
             return
         else:
-            p = json.loads(p['Policy'])
+            p = json.loads(p)
 
         statements = p.get('Statement', [])
         found = []
@@ -343,7 +370,8 @@ class AttachLambdaEncrypt(BucketActionBase):
         for r in regions:
             lambda_mgr = LambdaManager(
                 functools.partial(self.manager.session_factory, region=r))
-            region_funcs[r] = lambda_mgr.publish(func)
+            lambda_mgr.publish(func)
+            region_funcs[r] = func
 
         with self.executor_factory(max_workers=3) as w:
             results = []
@@ -371,7 +399,6 @@ class AttachLambdaEncrypt(BucketActionBase):
 class EncryptionRequiredPolicy(BucketActionBase):
 
     permissions = ("s3:GetBucketPolicy", "s3:PutBucketPolicy")
-
     schema = type_schema('encryption-policy')
 
     def __init__(self, data=None, manager=None):
@@ -390,31 +417,36 @@ class EncryptionRequiredPolicy(BucketActionBase):
             log.info("No policy found, creating new")
             p = {'Version': "2012-10-17", "Statement": []}
         else:
-            p = json.loads(p['Policy'])
+            p = json.loads(p)
+
+        encryption_sid = "RequiredEncryptedPutObject"
+        encryption_statement = {
+            'Sid': encryption_sid,
+            'Effect': 'Deny',
+            'Principal': '*',
+            'Action': 's3:PutObject',
+            "Resource": "arn:aws:s3:::%s/*" % b['Name'],
+            "Condition": {
+                # AWS Managed Keys or KMS keys, note policy language
+                # does not support custom kms (todo add issue)
+                "StringNotEquals": {
+                    "s3:x-amz-server-side-encryption": ["AES256", "aws:kms"]}}}
 
         statements = p.get('Statement', [])
         found = False
         for s in list(statements):
-            if s['Sid'] == 'RequireEncryptedPutObject':
-                log.debug(
-                    "Bucket:%s Found extant Encryption Policy" % b['Name'])
-                return
+            if s['Sid'] == encryption_sid:
+                log.debug("Bucket:%s Found extant encrypt policy", b['Name'])
+                if s != encryption_statement:
+                    log.info(
+                        "Bucket:%s updating extant encrypt policy", b['Name'])
+                    statements.remove(s)
+                else:
+                    return
 
         session = self.manager.session_factory()
         s3 = bucket_client(session, b)
-
-        statements.append(
-            {'Sid': 'RequireEncryptedPutObject',
-             'Effect': 'Deny',
-             'Principal': '*',
-             'Action': 's3:PutObject',
-             "Resource": "arn:aws:s3:::%s/*" % b['Name'],
-             "Condition": {
-                 # AWS Managed Keys or KMS keys, note policy language
-                 # does not support custom kms (todo add issue)
-                 "StringNotEquals": {
-                     "s3:x-amz-server-side-encryption": ["AES256", "aws:kms"]}}
-             })
+        statements.append(encryption_statement)
         p['Statement'] = statements
         log.info('Bucket:%s attached encryption policy' % b['Name'])
 
@@ -447,11 +479,17 @@ class BucketScanLog(object):
         return os.path.join(self.log_dir, "%s.json" % self.name)
 
     def __enter__(self):
+        # Don't require output directories
+        if self.log_dir is None:
+            return
+
         self.fh = open(self.path, 'w')
         self.fh.write("[\n")
         return self
 
     def __exit__(self, exc_type=None, exc_value=None, exc_frame=None):
+        if self.fh is None:
+            return
         # we need an empty marker list at end to avoid trailing commas
         self.fh.write("[]")
         # and close the surrounding list
@@ -464,6 +502,8 @@ class BucketScanLog(object):
 
     def add(self, keys):
         self.count += len(keys)
+        if self.fh is None:
+            return
         self.fh.write(json.dumps(keys))
         self.fh.write(",\n")
 
@@ -504,9 +544,22 @@ class ScanBucket(BucketActionBase):
     def process(self, buckets):
         results = []
         with self.executor_factory(max_workers=3) as w:
-            results.extend(
-                f for f in w.map(self, buckets) if f)
-        if self.denied_buckets:
+            futures = {}
+            for b in buckets:
+                futures[w.submit(self.process_bucket, b)] = b
+            for f in as_completed(futures):
+                if f.exception():
+                    self.log.error(
+                        "Error on bucket:%s region:%s policy:% error: %s",
+                        b['Name'], b.get('Location', 'unknown'),
+                        self.manager.data.get('name'), f.exception())
+                    self.denied_buckets.append(b['Name'])
+                    continue
+                result = f.result()
+                if result:
+                    results.append(result)
+
+        if self.denied_buckets and self.manager.log_dir:
             with open(
                     os.path.join(
                         self.manager.log_dir, 'denied.json'), 'w') as fh:
@@ -518,6 +571,7 @@ class ScanBucket(BucketActionBase):
         log.info(
             "Scanning bucket:%s visitor:%s style:%s" % (
                 b['Name'], self.__class__.__name__, self.get_bucket_style(b)))
+
         s = self.manager.session_factory()
         s3 = bucket_client(s, b)
 
@@ -618,6 +672,10 @@ class EncryptExtantKeys(ScanBucket):
             'crypto': {'enum': ['AES256', 'aws:kms']}
             }
         }
+
+    metrics = [
+        ('Total Keys', {'Scope': 'Account'}),
+        ('Unencrypted', {'Scope': 'Account'})]
 
     def process(self, buckets):
         t = time.time()

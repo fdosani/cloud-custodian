@@ -27,8 +27,6 @@ class ResourceManager(object):
     filter_registry = None
     action_registry = None
 
-    supports_dry_run = False
-
     executor_factory = ThreadPoolExecutor
 
     def __init__(self, ctx, data):
@@ -51,11 +49,8 @@ class ResourceManager(object):
     def format_json(self, resources, fh):
         return dumps(resources, fh, indent=2)
 
-    def resource_query(self):
-        """Return server side query filter for the given api."""
-        return []
-
     def get_resources(self, resource_ids):
+        """Retrieve a set of resources by id."""
         return []
 
     def filter_resources(self, resources, event=None):
@@ -69,3 +64,8 @@ class ResourceManager(object):
         self.log.info("Filtered from %d to %d %s" % (
             original, len(resources), self.__class__.__name__.lower()))
         return resources
+
+    def get_model(self):
+        """Returns the resource meta-model.
+        """
+        return self.query.resolve(self.resource_type)

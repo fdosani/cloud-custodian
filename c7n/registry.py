@@ -16,7 +16,7 @@
 class PluginRegistry(object):
     """A plugin registry
 
-    Maid is intended to be innately pluggable both internally and
+    Custodian is intended to be innately pluggable both internally and
     externally, for resource types and their filters and actions.
 
     This plugin registry abstraction provides the core mechanism for
@@ -50,12 +50,14 @@ class PluginRegistry(object):
     def register(self, name, klass=None):
         # invoked as function
         if klass:
+            klass.type = name
             self._factories[name] = klass
             return klass
 
         # invoked as class decorator
         def _register_class(klass):
             self._factories[name] = klass
+            klass.type = name
             return klass
         return _register_class
 

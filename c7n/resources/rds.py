@@ -60,16 +60,19 @@ Todo/Notes
 
 """
 import logging
+import re
 
 from botocore.exceptions import ClientError
 from concurrent.futures import as_completed
 
 from c7n.actions import ActionRegistry, BaseAction
-from c7n.filters import FilterRegistry, Filter
+from c7n.filters import FilterRegistry, Filter, AgeFilter, OPERATORS
 from c7n.manager import resources
 from c7n.query import QueryResourceManager
 from c7n import tags
-from c7n.utils import local_session, type_schema, get_account_id
+from c7n.utils import local_session, type_schema, get_account_id, chunks
+
+from skew.resources.aws import rds
 
 log = logging.getLogger('custodian.rds')
 
@@ -82,36 +85,60 @@ filters.register('marked-for-op', tags.TagActionFilter)
 
 @resources.register('rds')
 class RDS(QueryResourceManager):
+    """Resource manager for RDS DB instances.
+    """
 
-    resource_type = "aws.rds.db"
+    class resource_type(rds.DBInstance.Meta):
+        filter_name = 'DBInstanceIdentifier'
+
     filter_registry = filters
     action_registry = actions
-    account_id = None
+    _arn_generator = _account_id = None
+
+    def __init__(self, data, options):
+        super(RDS, self).__init__(data, options)
+
+    @property
+    def account_id(self):
+        if self._account_id is None:
+            session = local_session(self.session_factory)
+            self._account_id = get_account_id(session)
+        return self._account_id
+
+    @property
+    def arn_generator(self):
+        if self._arn_generator is None:
+            self._arn_generator = DBInstanceARNGenerator(
+                self.config.region,
+                self.account_id)
+        return self._arn_generator
 
     def augment(self, resources):
-        session = local_session(self.session_factory)
-        if self.account_id is None:
-            self.account_id = get_account_id(session)
-        _rds_tags(
-            self.query.resolve(self.resource_type),
+        filter(None, _rds_tags(
+            self.get_model(),
             resources, self.session_factory, self.executor_factory,
-            self.account_id, region=self.config.region)
+            self.arn_generator))
+        return resources
 
 
 def _rds_tags(
-        model, dbs, session_factory, executor_factory, account_id, region):
+        model, dbs, session_factory, executor_factory, arn_generator):
     """Augment rds instances with their respective tags."""
 
     def process_tags(db):
         client = local_session(session_factory).client('rds')
-        arn = "arn:aws:rds:%s:%s:db:%s" % (region, account_id, db[model.id])
-        tag_list = client.list_tags_for_resource(ResourceName=arn)['TagList']
+        arn = arn_generator.generate(db[model.id])
+        try:
+            tag_list = client.list_tags_for_resource(ResourceName=arn)['TagList']
+        except ClientError as e:
+            if e.response['Error']['Code'] == "DBInstanceNotFound":
+                return None
         db['Tags'] = tag_list or []
         return db
 
     # Rds maintains a low api call limit, so this can take some time :-(
-    with executor_factory(max_workers=2) as w:
-        list(w.map(process_tags, dbs))
+    with executor_factory(max_workers=1) as w:
+        return list(w.map(process_tags, dbs))
 
 
 @filters.register('default-vpc')
@@ -138,7 +165,6 @@ class DefaultVpc(Filter):
             vpcs = [v['VpcId'] for v
                     in client.describe_vpcs(VpcIds=[vpc_id])['Vpcs']
                     if v['IsDefault']]
-            self.vpcs.add(vpc_id)
             if not vpcs:
                 return []
             self.default_vpc = vpcs.pop()
@@ -161,13 +187,33 @@ class TagDelayedAction(tags.TagDelayedAction):
     def process_resource_set(self, resources, tags):
         client = local_session(self.manager.session_factory).client('rds')
         for r in resources:
-            arn = "arn:aws:rds:%s:%s:db:%s" % (
-                self.manager.config.region, self.manager.account_id,
-                r['DBInstanceIdentifier'])
+            arn = self.manager.arn_generator.generate(r['DBInstanceIdentifier'])
             client.add_tags_to_resource(ResourceName=arn, Tags=tags)
 
 
+@actions.register('auto-patch')
+class AutoPatch(BaseAction):
+
+    schema = type_schema(
+        'auto-patch',
+        minor={'type': 'boolean'}, window={'type': 'string'})
+
+    def process(self, resources):
+        client = local_session(
+            self.manager.session_factory).client('rds')
+
+        params = {'AutoMinorVersionUpgrade': self.data.get('minor', True)}
+        if self.data.get('window'):
+            params['PreferredMaintenanceWindow'] = self.data['minor']
+
+        for r in resources:
+            client.modify_db_instance(
+                DBInstanceIdentifier=r['DBInstanceIdentifier'],
+                **params)
+
+
 @actions.register('tag')
+@actions.register('mark')
 class Tag(tags.Tag):
 
     concurrency = 2
@@ -177,13 +223,12 @@ class Tag(tags.Tag):
         client = local_session(
             self.manager.session_factory).client('rds')
         for r in resources:
-            arn = "arn:aws:rds:%s:%s:db:%s" % (
-                self.manager.config.region, self.manager.account_id,
-                r['DBInstanceIdentifier'])
+            arn = self.manager.arn_generator.generate(r['DBInstanceIdentifier'])
             client.add_tags_to_resource(ResourceName=arn, Tags=tags)
 
 
 @actions.register('remove-tag')
+@actions.register('unmark')
 class RemoveTag(tags.RemoveTag):
 
     concurrency = 2
@@ -193,9 +238,7 @@ class RemoveTag(tags.RemoveTag):
         client = local_session(
             self.manager.session_factory).client('rds')
         for r in resources:
-            arn = "arn:aws:rds:%s:%s:db:%s" % (
-                self.manager.config.region, self.manager.account_id,
-                r['DBInstanceIdentifier'])
+            arn = self.manager.arn_generator.generate(r['DBInstanceIdentifier'])
             client.remove_tags_from_resource(
                 ResourceName=arn, TagKeys=tag_keys)
 
@@ -269,7 +312,9 @@ class Snapshot(BaseAction):
 class RetentionWindow(BaseAction):
 
     date_attribute = "BackupRetentionPeriod"
-    schema = type_schema('retention', days={'type': 'number'})
+    schema = type_schema(
+        'retention',
+        **{'days': {'type': 'number'}, 'copy-tags': {'type': 'boolean'}})
 
     def process(self, resources):
         with self.executor_factory(max_workers=3) as w:
@@ -285,13 +330,142 @@ class RetentionWindow(BaseAction):
                                 f.exception()))
 
     def process_snapshot_retention(self, resource):
-        v = int(resource.get('BackupRetentionPeriod', 0))
-        if v == 0 or v < self.data['days']:
-            self.set_retention_window(resource)
+        current_retention = int(resource.get('BackupRetentionPeriod', 0))
+        current_copy_tags = resource['CopyTagsToSnapshot']
+        new_retention = self.data['days']
+        new_copy_tags = self.data.get('copy-tags', True)
+
+        if ((current_retention < new_retention or
+                current_copy_tags != new_copy_tags) and
+                self._db_instance_eligible_for_backup(resource)):
+            self.set_retention_window(
+                resource,
+                max(current_retention, new_retention),
+                new_copy_tags)
             return resource
 
-    def set_retention_window(self, resource):
+    def set_retention_window(self, resource, retention, copy_tags):
         c = local_session(self.manager.session_factory).client('rds')
         c.modify_db_instance(
             DBInstanceIdentifier=resource['DBInstanceIdentifier'],
-            BackupRetentionPeriod=self.data['days'])
+            BackupRetentionPeriod=retention,
+            CopyTagsToSnapshot=copy_tags)
+
+    def _db_instance_eligible_for_backup(self, resource):
+        db_instance_id = resource['DBInstanceIdentifier']
+
+        # Database instance is not in available state
+        if resource.get('DBInstanceStatus', '') != 'available':
+            log.debug("DB instance %s is not in available state" %
+                (db_instance_id))
+            return False
+        # The specified DB Instance is a member of a cluster and its backup retention should not be modified directly.
+        #   Instead, modify the backup retention of the cluster using the ModifyDbCluster API
+        if resource.get('DBClusterIdentifier', ''):
+            log.debug("DB instance %s is a cluster member" %
+                (db_instance_id))
+            return False
+        # DB Backups not supported on a read replica for engine postgres
+        if (resource.get('ReadReplicaSourceDBInstanceIdentifier', '') and
+                resource.get('Engine', '') == 'postgres'):
+            log.debug("DB instance %s is a postgres read-replica" %
+                (db_instance_id))
+            return False
+        # DB Backups not supported on a read replica running a mysql version before 5.6.
+        if (resource.get('ReadReplicaSourceDBInstanceIdentifier', '') and
+                resource.get('Engine', '') == 'mysql'):
+            engine_version = resource.get('EngineVersion', '')
+            # Assume "<major>.<minor>.<whatever>"
+            match = re.match(r'(?P<major>\d+)\.(?P<minor>\d+)\..*', engine_version)
+            if (match and int(match.group('major')) < 5 or
+                (int(match.group('major')) == 5 and int(match.group('minor')) < 6)):
+                log.debug("DB instance %s is a version %s mysql read-replica" %
+                    (db_instance_id, engine_version))
+                return False
+        return True
+
+
+@resources.register('rds-snapshot')
+class RDSSnapshot(QueryResourceManager):
+    """Resource manager for RDS DB snapshots.
+    """
+
+    class Meta(object):
+
+        service = 'rds'
+        type = 'rds-snapshot'
+        enum_spec = ('describe_db_snapshots', 'DBSnapshots', None)
+        name = id = 'DBSnapshotIdentifier'
+        filter_name = None
+        filter_type = None
+        dimension = None
+        date = 'SnapshotCreateTime'
+
+    resource_type = Meta
+
+    filter_registry = FilterRegistry('rds-snapshot.filters')
+    action_registry = ActionRegistry('rds-snapshot.actions')
+
+
+@RDSSnapshot.filter_registry.register('age')
+class RDSSnapshotAge(AgeFilter):
+
+    schema = type_schema(
+        'age', days={'type': 'number'},
+        op={'type': 'string', 'enum': OPERATORS.keys()})
+
+    date_attribute = 'SnapshotCreateTime'
+
+
+@RDSSnapshot.action_registry.register('delete')
+class RDSSnapshotDelete(BaseAction):
+
+    def process(self, snapshots):
+        log.info("Deleting %d rds snapshots", len(snapshots))
+        with self.executor_factory(max_workers=3) as w:
+            futures = []
+            for snapshot_set in chunks(reversed(snapshots), size=50):
+                futures.append(
+                    w.submit(self.process_snapshot_set, snapshot_set))
+                for f in as_completed(futures):
+                    if f.exception():
+                        self.log.error(
+                            "Exception deleting snapshot set \n %s" % (
+                                f.exception()))
+        return snapshots
+
+    def process_snapshot_set(self, snapshots_set):
+        c = local_session(self.manager.session_factory).client('rds')
+        for s in snapshots_set:
+            try:
+                c.delete_db_snapshot(
+                    DBSnapshotIdentifier=s['DBSnapshotIdentifier'])
+            except ClientError as e:
+                raise
+
+
+class ARNGenerator(object):
+    """Base class for RDS ARN generators.
+    """
+
+    def __init__(self, region, account_id, resource_type):
+        self._region = region
+        self._account_id = account_id
+        self._resource_type = resource_type
+
+    def generate(self, name):
+        """Generates an Amazon Resource Name for the specified resource.
+
+        See http://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/USER_Tagging.html
+        """
+        arn = 'arn:aws:rds:%s:%s:%s:%s' % (
+            self._region, self._account_id, self._resource_type, name)
+        return arn
+
+
+class DBInstanceARNGenerator(ARNGenerator):
+    """RDS DB instance ARN generator.
+    """
+
+    def __init__(self, region, account_id):
+        super(DBInstanceARNGenerator, self).__init__(region, account_id, 'db')

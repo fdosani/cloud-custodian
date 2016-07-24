@@ -14,6 +14,7 @@
 """Ops feedback via log subscription
 """
 import boto3
+from botocore.vendored import requests
 
 import base64
 from datetime import datetime
@@ -22,13 +23,17 @@ import textwrap
 import zlib
 
 
-sns = None
+config = logs = sns = None
 
 
 def init():
-    global sns
+    global sns, logs, config
     if sns is None:
         sns = boto3.client('sns')
+    if logs is None:
+        logs = boto3.client('logs')
+    with open('config.json') as fh:
+        config = json.load(fh)
 
 
 def message_event(evt):
@@ -39,13 +44,23 @@ def message_event(evt):
 
 def process_log_event(event, context):
     """Format log events and relay via sns/email"""
-
     init()
-    with open('config.json') as fh:
-        config = json.load(fh)
     serialized = event['awslogs'].pop('data')
     data = json.loads(zlib.decompress(
         base64.b64decode(serialized), 16+zlib.MAX_WBITS))
+
+    # Fetch additional logs for context (20s window)
+    timestamps = [e['timestamp'] for e in data['logEvents']]
+    start = min(timestamps) - 1000 * 15
+    end = max(timestamps) + 1000 * 5
+
+    events = logs.get_log_events(
+        logGroupName=data['logGroup'],
+        logStreamName=data['logStream'],
+        startTime=start,
+        endTime=end,
+        startFromHead=True)['events']
+
     message = [
         "An error was detected",
         "",
@@ -56,7 +71,12 @@ def process_log_event(event, context):
         "Log Contents",
         ""]
 
+    # We may get things delivered from log sub that are not in log events
     for evt in data['logEvents']:
+        if evt not in events:
+            events.append(evt)
+
+    for evt in events:
         message.append(message_event(evt))
         message.append("")
 
@@ -64,6 +84,7 @@ def process_log_event(event, context):
         TopicArn=config['topic'],
         Subject=config['subject'],
         Message='\n'.join(message))
+
     sns.publish(**params)
 
 
@@ -83,7 +104,7 @@ def get_function(session_factory, name, role, sns_topic, log_groups,
         LambdaFunction, PythonPackageArchive, CloudWatchLogSubscription)
 
     config = dict(
-        name='cloud-maid-error-notify',
+        name=name,
         handler='logsub.process_log_event',
         runtime='python2.7',
         memory_size=512,
@@ -97,7 +118,7 @@ def get_function(session_factory, name, role, sns_topic, log_groups,
     archive = PythonPackageArchive(
         # Directory to lambda file
         os.path.join(
-            os.path.dirname(inspect.getabsfile(c7n)), 'logsub.py'),
+            os.path.dirname(inspect.getabsfile(c7n)), 'ufuncs', 'logsub.py'),
         # Don't include virtualenv deps
         lib_filter=lambda x, y, z: ([], []))
     archive.create()

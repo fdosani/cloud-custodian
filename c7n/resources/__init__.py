@@ -18,15 +18,24 @@
 
 def load_resources():
     import ami
+    import acm
+    import apigw
     import asg
+    import awslambda
     import cache
     import cfn
     import cw
     import dynamodb
     import ebs
     import ec2
+    import ecr
+    import ecs
     import elb
+    import emr
+    import firehose
+    import glacier
     import iam
+    import kinesis
     import kms
     import redshift
     import rds
